@@ -1,1 +1,187 @@
-// Momentum Reversal with Confirmation\n//\n// Core insight: in a bearish market, don't enter at the bottom of a dip.\n// Enter AFTER the bounce is confirmed by positive short-term momentum.\n//\n// Entry conditions (all must be true):\n//   - 20-bar momentum < -0.4% (there was a significant dip)\n//   - 5-bar momentum > 0.08% (bounce is underway, confirmed)\n//   - EMA(3) > EMA(8) (micro trend turned up)\n//\n// Exit conditions (any one):\n//   - Value >= cost * 1.010 (take profit 1.0%)\n//   - Value <= cost * 0.995 (stop loss 0.5%)\n//   - 5-bar momentum < -0.05% and held for > 10 bars (momentum dying)\n//   - Held for 150 bars (time stop, 2.5 hours)\n//\n// Deterministic, float64 only, no randomness.\n\nimport { BPS, runBars, type Bar, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';\n\nconst MOM_SHORT = 5;\nconst MOM_LONG = 20;\nconst EMA_FAST = 3;\nconst EMA_SLOW = 8;\n\nconst MOM_LONG_ENTRY_BELOW = -0.004;   // 20-bar momentum < -0.4% (deeper dip required)\nconst MOM_SHORT_ENTRY_ABOVE = 0.0008;  // 5-bar momentum > 0.08% (confirmed bounce)\nconst MOM_SHORT_EXIT_BELOW = -0.0005;  // 5-bar momentum dying\n\nconst TP_NUM = 1010n;   // 1.0% take profit\nconst TP_DEN = 1000n;\nconst SL_NUM = 995n;    // 0.5% stop loss\nconst SL_DEN = 1000n;\nconst TIME_STOP = 150;  // 2.5 hours\nconst MIN_HOLD = 10;    // minimum hold before momentum exit\n\nconst MAX_SLIPPAGE_BPS = 60;\n\ninterface EmaState {\n  span: number;\n  warm: number[];\n  value: number | null;\n}\n\ninterface SymbolState {\n  closes: number[];        // last MOM_LONG + 1 closes\n  emaFast: EmaState;\n  emaSlow: EmaState;\n  entryBar: number;\n}\n\nconst symbols = new Map<string, SymbolState>();\n\nfunction newEma(span: number): EmaState {\n  return { span, warm: [], value: null };\n}\n\nfunction stepEma(e: EmaState, c: number): void {\n  if (e.value !== null) {\n    e.value += (2 / (e.span + 1)) * (c - e.value);\n  } else {\n    e.warm.push(c);\n    if (e.warm.length === e.span) {\n      e.value = e.warm.reduce((a, x) => a + x, 0) / e.span;\n    }\n  }\n}\n\nfunction getOrCreate(symbol: string): SymbolState {\n  let s = symbols.get(symbol);\n  if (!s) {\n    s = {\n      closes: [],\n      emaFast: newEma(EMA_FAST),\n      emaSlow: newEma(EMA_SLOW),\n      entryBar: -999,\n    };\n    symbols.set(symbol, s);\n  }\n  return s;\n}\n\nfunction update(bar: Bar): void {\n  const s = getOrCreate(bar.symbol);\n  const c = Number(bar.c);\n  s.closes.push(c);\n  if (s.closes.length > MOM_LONG + 1) s.closes.shift();\n  stepEma(s.emaFast, c);\n  stepEma(s.emaSlow, c);\n}\n\nfunction momN(s: SymbolState, n: number): number | null {\n  if (s.closes.length < n + 1) return null;\n  const prev = s.closes[s.closes.length - 1 - n]!;\n  const curr = s.closes[s.closes.length - 1]!;\n  if (prev === 0) return null;\n  return (curr - prev) / prev;\n}\n\nfunction shouldEnter(s: SymbolState): boolean {\n  const momLong = momN(s, MOM_LONG);\n  const momShort = momN(s, MOM_SHORT);\n  if (momLong === null || momShort === null) return false;\n\n  // There was a dip AND bounce is confirmed\n  if (momLong >= MOM_LONG_ENTRY_BELOW) return false;\n  if (momShort <= MOM_SHORT_ENTRY_ABOVE) return false;\n\n  // Micro trend must be up\n  if (s.emaFast.value === null || s.emaSlow.value === null) return false;\n  if (s.emaFast.value <= s.emaSlow.value) return false;\n\n  return true;\n}\n\nfunction shouldExit(state: BarsState, s: SymbolState, symbol: string, held: { qty: bigint; cost: bigint }, seq: number): boolean {\n  const value = state.value(symbol, held.qty);\n\n  // Take profit\n  if (value * TP_DEN >= held.cost * TP_NUM) return true;\n\n  // Stop loss\n  if (value * SL_DEN <= held.cost * SL_NUM) return true;\n\n  // Momentum dying (after min hold)\n  const barsHeld = seq - s.entryBar;\n  if (barsHeld > MIN_HOLD) {\n    const momShort = momN(s, MOM_SHORT);\n    if (momShort !== null && momShort < MOM_SHORT_EXIT_BELOW) return true;\n  }\n\n  // Time stop\n  if (barsHeld >= TIME_STOP) return true;\n\n  return false;\n}\n\nawait runBars({\n  onBatch(state, batch) {\n    const fresh = new Set<string>();\n    for (const bar of batch.bars) {\n      update(bar);\n      fresh.add(bar.symbol);\n    }\n\n    if (state.warmingUp) return [];\n\n    const { caps, fees } = state.hello;\n    const sells: SellInput[] = [];\n    const entries: string[] = [];\n\n    for (const { symbol } of state.hello.symbols) {\n      if (!fresh.has(symbol)) continue;\n      const s = symbols.get(symbol);\n      if (!s) continue;\n\n      const held = state.positions.get(symbol);\n      if (held !== undefined) {\n        if (shouldExit(state, s, symbol, held, batch.seq)) {\n          sells.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });\n        }\n      } else if (shouldEnter(s)) {\n        entries.push(symbol);\n        s.entryBar = batch.seq;\n      }\n    }\n\n    const orders: (SellInput | BuyInput)[] = sells.slice(0, caps.max_orders_per_bar);\n    const slots = Math.min(state.hello.symbols.length, caps.max_open_positions);\n    const stake = state.equity / BigInt(slots);\n    const byWeight = (BigInt(caps.max_weight_bps) * state.equity) / BPS;\n    let room = slots - state.positions.size;\n    let cash = state.cash;\n\n    for (const symbol of entries) {\n      if (room <= 0 || orders.length >= caps.max_orders_per_bar) break;\n      let slice = stake < byWeight ? stake : byWeight;\n      if (cash < slice) slice = cash;\n      if (slice === 0n || slice < BigInt(fees.min_notional_quote_units)) break;\n      orders.push({ side: 'buy', symbol, notional_quote_units: slice, max_slippage_bps: MAX_SLIPPAGE_BPS });\n      cash -= slice;\n      room--;\n    }\n\n    return orders;\n  },\n});
+// Momentum Reversal with Confirmation
+//
+// Core insight: in a bearish market, don't enter at the bottom of a dip.
+// Enter AFTER the bounce is confirmed by positive short-term momentum.
+//
+// Entry conditions (all must be true):
+//   - 20-bar momentum < -0.4% (there was a significant dip)
+//   - 5-bar momentum > 0.08% (bounce is underway, confirmed)
+//   - EMA(3) > EMA(8) (micro trend turned up)
+//
+// Exit conditions (any one):
+//   - Value >= cost * 1.010 (take profit 1.0%)
+//   - Value <= cost * 0.995 (stop loss 0.5%)
+//   - 5-bar momentum < -0.05% and held for > 10 bars (momentum dying)
+//   - Held for 150 bars (time stop, 2.5 hours)
+//
+// Deterministic, float64 only, no randomness.
+
+import { BPS, runBars, type Bar, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
+
+const MOM_SHORT = 5;
+const MOM_LONG = 20;
+const EMA_FAST = 3;
+const EMA_SLOW = 8;
+
+const MOM_LONG_ENTRY_BELOW = -0.004;   // 20-bar momentum < -0.4% (deeper dip required)
+const MOM_SHORT_ENTRY_ABOVE = 0.0008;  // 5-bar momentum > 0.08% (confirmed bounce)
+const MOM_SHORT_EXIT_BELOW = -0.0005;  // 5-bar momentum dying
+
+const TP_NUM = 1010n;   // 1.0% take profit
+const TP_DEN = 1000n;
+const SL_NUM = 995n;    // 0.5% stop loss
+const SL_DEN = 1000n;
+const TIME_STOP = 150;  // 2.5 hours
+const MIN_HOLD = 10;    // minimum hold before momentum exit
+
+const MAX_SLIPPAGE_BPS = 60;
+
+interface EmaState {
+  span: number;
+  warm: number[];
+  value: number | null;
+}
+
+interface SymbolState {
+  closes: number[];        // last MOM_LONG + 1 closes
+  emaFast: EmaState;
+  emaSlow: EmaState;
+  entryBar: number;
+}
+
+const symbols = new Map<string, SymbolState>();
+
+function newEma(span: number): EmaState {
+  return { span, warm: [], value: null };
+}
+
+function stepEma(e: EmaState, c: number): void {
+  if (e.value !== null) {
+    e.value += (2 / (e.span + 1)) * (c - e.value);
+  } else {
+    e.warm.push(c);
+    if (e.warm.length === e.span) {
+      e.value = e.warm.reduce((a, x) => a + x, 0) / e.span;
+    }
+  }
+}
+
+function getOrCreate(symbol: string): SymbolState {
+  let s = symbols.get(symbol);
+  if (!s) {
+    s = {
+      closes: [],
+      emaFast: newEma(EMA_FAST),
+      emaSlow: newEma(EMA_SLOW),
+      entryBar: -999,
+    };
+    symbols.set(symbol, s);
+  }
+  return s;
+}
+
+function update(bar: Bar): void {
+  const s = getOrCreate(bar.symbol);
+  const c = Number(bar.c);
+  s.closes.push(c);
+  if (s.closes.length > MOM_LONG + 1) s.closes.shift();
+  stepEma(s.emaFast, c);
+  stepEma(s.emaSlow, c);
+}
+
+function momN(s: SymbolState, n: number): number | null {
+  if (s.closes.length < n + 1) return null;
+  const prev = s.closes[s.closes.length - 1 - n]!;
+  const curr = s.closes[s.closes.length - 1]!;
+  if (prev === 0) return null;
+  return (curr - prev) / prev;
+}
+
+function shouldEnter(s: SymbolState): boolean {
+  const momLong = momN(s, MOM_LONG);
+  const momShort = momN(s, MOM_SHORT);
+  if (momLong === null || momShort === null) return false;
+
+  // There was a dip AND bounce is confirmed
+  if (momLong >= MOM_LONG_ENTRY_BELOW) return false;
+  if (momShort <= MOM_SHORT_ENTRY_ABOVE) return false;
+
+  // Micro trend must be up
+  if (s.emaFast.value === null || s.emaSlow.value === null) return false;
+  if (s.emaFast.value <= s.emaSlow.value) return false;
+
+  return true;
+}
+
+function shouldExit(state: BarsState, s: SymbolState, symbol: string, held: { qty: bigint; cost: bigint }, seq: number): boolean {
+  const value = state.value(symbol, held.qty);
+
+  // Take profit
+  if (value * TP_DEN >= held.cost * TP_NUM) return true;
+
+  // Stop loss
+  if (value * SL_DEN <= held.cost * SL_NUM) return true;
+
+  // Momentum dying (after min hold)
+  const barsHeld = seq - s.entryBar;
+  if (barsHeld > MIN_HOLD) {
+    const momShort = momN(s, MOM_SHORT);
+    if (momShort !== null && momShort < MOM_SHORT_EXIT_BELOW) return true;
+  }
+
+  // Time stop
+  if (barsHeld >= TIME_STOP) return true;
+
+  return false;
+}
+
+await runBars({
+  onBatch(state, batch) {
+    const fresh = new Set<string>();
+    for (const bar of batch.bars) {
+      update(bar);
+      fresh.add(bar.symbol);
+    }
+
+    if (state.warmingUp) return [];
+
+    const { caps, fees } = state.hello;
+    const sells: SellInput[] = [];
+    const entries: string[] = [];
+
+    for (const { symbol } of state.hello.symbols) {
+      if (!fresh.has(symbol)) continue;
+      const s = symbols.get(symbol);
+      if (!s) continue;
+
+      const held = state.positions.get(symbol);
+      if (held !== undefined) {
+        if (shouldExit(state, s, symbol, held, batch.seq)) {
+          sells.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
+        }
+      } else if (shouldEnter(s)) {
+        entries.push(symbol);
+        s.entryBar = batch.seq;
+      }
+    }
+
+    const orders: (SellInput | BuyInput)[] = sells.slice(0, caps.max_orders_per_bar);
+    const slots = Math.min(state.hello.symbols.length, caps.max_open_positions);
+    const stake = state.equity / BigInt(slots);
+    const byWeight = (BigInt(caps.max_weight_bps) * state.equity) / BPS;
+    let room = slots - state.positions.size;
+    let cash = state.cash;
+
+    for (const symbol of entries) {
+      if (room <= 0 || orders.length >= caps.max_orders_per_bar) break;
+      let slice = stake < byWeight ? stake : byWeight;
+      if (cash < slice) slice = cash;
+      if (slice === 0n || slice < BigInt(fees.min_notional_quote_units)) break;
+      orders.push({ side: 'buy', symbol, notional_quote_units: slice, max_slippage_bps: MAX_SLIPPAGE_BPS });
+      cash -= slice;
+      room--;
+    }
+
+    return orders;
+  },
+});
